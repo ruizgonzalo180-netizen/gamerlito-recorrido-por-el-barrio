@@ -13,6 +13,19 @@ function createGameStream(video, onReady, onFailure) {
   let resumeAt = 0;
   let useHd = false;
 
+  function shouldStartIn4k() {
+    const connection = navigator.connection;
+    if (connection && (connection.saveData || /^(slow-2g|2g|3g)$/.test(connection.effectiveType))) return false;
+    const area = video.parentElement.getBoundingClientRect();
+    const width = area.width || window.innerWidth;
+    const height = area.height || window.innerHeight;
+    const density = window.devicePixelRatio || 1;
+    // A full-screen 4K viewport can have a CSS width of just 1920 on a HiDPI display.
+    if (Math.max(width, height) * density < 3200 || Math.min(width, height) * density < 1700) return false;
+    const source = window.MediaSource || window.ManagedMediaSource;
+    return Boolean(source && source.isTypeSupported('video/mp4; codecs="vp09.00.51.08"'));
+  }
+
   function release() {
     revision++;
     state = 'idle';
@@ -65,7 +78,21 @@ function createGameStream(video, onReady, onFailure) {
     state = 'loading';
     const url = useHd ? hd : master;
     if (useHlsJs) {
-      player = new Hls({startLevel:0, capLevelToPlayerSize:true, maxBufferLength:15});
+      // The two renditions use different codecs. hls.js stays in the codec family
+      // it starts with, so select the first rendition after it filters browser support.
+      player = new Hls({autoStartLoad:false, maxBufferLength:15});
+      player.on(Hls.Events.MANIFEST_PARSED, (_, {levels}) => {
+        const original = !useHd && shouldStartIn4k() ? levels.findIndex(level => level.height >= 2160) : -1;
+        player.startLevel = original >= 0 ? original : 0;
+        player.startLoad();
+      });
+      let slowFragments = 0;
+      player.on(Hls.Events.FRAG_LOADED, (_, {frag}) => {
+        if (frag.type !== 'main' || !Number.isFinite(frag.sn) || player.levels[frag.level]?.height < 2160) return;
+        const elapsed = (frag.stats.loading.end - frag.stats.loading.start) / 1000;
+        slowFragments = elapsed > frag.duration ? slowFragments + 1 : 0;
+        if (slowFragments >= 2) fail(id);
+      });
       player.on(Hls.Events.ERROR, (_, data) => { if (data.fatal) fail(id); });
       player.loadSource(url);
       player.attachMedia(video);
